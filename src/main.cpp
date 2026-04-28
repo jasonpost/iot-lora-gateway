@@ -3,6 +3,7 @@
 #include <RadioLib.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
 #include <Wire.h>
 #include <stdarg.h>
 #include <Adafruit_GFX.h>
@@ -14,6 +15,10 @@
 static constexpr int SCREEN_WIDTH = 128;
 static constexpr int SCREEN_HEIGHT = 64;
 static constexpr size_t LORA_MQTT_PAYLOAD_BUFFER_SIZE = 512;
+static constexpr size_t LORA_NODE_STATE_PAYLOAD_BUFFER_SIZE = 768;
+static constexpr size_t LORA_NODE_TOPIC_BUFFER_SIZE = 128;
+static constexpr size_t LORA_NODE_DISCOVERY_CACHE_SIZE = 64;
+static constexpr size_t NODE_DISCOVERY_ID_BUFFER_SIZE = 64;
 static constexpr size_t MQTT_DISCOVERY_TOPIC_BUFFER_SIZE = 160;
 static constexpr size_t MQTT_DISCOVERY_PAYLOAD_BUFFER_SIZE = 768;
 
@@ -48,6 +53,20 @@ struct SensorDiscoveryDef {
   const char* stateClass;
 };
 
+struct NodeSensorDiscoveryDef {
+  const char* field;
+  const char* objectSuffix;
+  const char* name;
+  const char* unit;
+  const char* deviceClass;
+  const char* stateClass;
+};
+
+struct NodeDiscoveryCacheEntry {
+  char nodeId[33];
+  const char* field;
+};
+
 const BinarySensorDiscoveryDef BINARY_SENSOR_DISCOVERY[] = {
   {"wifi_connected", "Wi-Fi Connected", "{{ 'ON' if value_json.wifi_connected else 'OFF' }}", "connectivity"},
   {"mqtt_connected", "MQTT Connected", "{{ 'ON' if value_json.mqtt_connected else 'OFF' }}", "connectivity"},
@@ -62,6 +81,7 @@ const SensorDiscoveryDef SENSOR_DISCOVERY[] = {
   {"wifi_rssi", "Wi-Fi RSSI", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.wifi_rssi_dbm }}", "dBm", "signal_strength", "measurement"},
   {"packets_received", "LoRa Packets Received", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.packets_received }}", "", "", "total_increasing"},
   {"decode_failures", "LoRa Decode Failures", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.decode_failures }}", "", "", "total_increasing"},
+  {"payload_parse_failures", "LoRa Payload Parse Failures", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.payload_parse_failures }}", "", "", "total_increasing"},
   {"rx_failures", "LoRa RX Failures", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.rx_failures }}", "", "", "total_increasing"},
   {"mqtt_publish_failures", "MQTT Publish Failures", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.mqtt_publish_failures }}", "", "", "total_increasing"},
   {"lora_irq_overruns", "LoRa IRQ Overruns", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.lora_irq_overruns }}", "", "", "total_increasing"},
@@ -73,6 +93,17 @@ const SensorDiscoveryDef SENSOR_DISCOVERY[] = {
   {"temperature", "Attic Temperature", GATEWAY_MQTT_TOPIC_TEMPERATURE, "{{ value_json.temperature_c }}", "C", "temperature", "measurement"},
   {"humidity", "Attic Humidity", GATEWAY_MQTT_TOPIC_TEMPERATURE, "{{ value_json.humidity_percent }}", "%", "humidity", "measurement"},
   {"pressure", "Attic Pressure", GATEWAY_MQTT_TOPIC_TEMPERATURE, "{{ value_json.pressure_hpa }}", "hPa", "pressure", "measurement"},
+};
+
+const NodeSensorDiscoveryDef NODE_SENSOR_DISCOVERY[] = {
+  {"temperature_c", "temperature_c", "Temperature C", "C", "temperature", "measurement"},
+  {"temperature_f", "temperature_f", "Temperature F", "F", "temperature", "measurement"},
+  {"humidity_pct", "humidity", "Humidity", "%", "humidity", "measurement"},
+  {"battery_v", "battery", "Battery", "V", "voltage", "measurement"},
+  {"rssi_dbm", "rssi", "RSSI", "dBm", "signal_strength", "measurement"},
+  {"snr_db", "snr", "SNR", "dB", "", "measurement"},
+  {"gateway_packet_count", "gateway_packet_count", "Gateway Packet Count", "", "", "total_increasing"},
+  {"seq", "sequence", "Sequence", "", "", "measurement"},
 };
 
 bool loraReady = false;
@@ -95,6 +126,7 @@ unsigned long lastLoRaRecoveryAttemptMs = 0;
 int lastLoRaRxState = RADIOLIB_ERR_NONE;
 uint32_t loraPacketsReceived = 0;
 uint32_t loraDecodeFailures = 0;
+uint32_t loraPayloadParseFailures = 0;
 uint32_t loraRxFailures = 0;
 uint32_t loraRecoveryAttempts = 0;
 uint32_t mqttPublishSuccesses = 0;
@@ -109,6 +141,8 @@ uint32_t minFreeHeap = UINT32_MAX;
 float lastTemperatureC = 0.0;
 float lastHumidityPercent = 0.0;
 float lastPressureHpa = 0.0;
+NodeDiscoveryCacheEntry nodeDiscoveryCache[LORA_NODE_DISCOVERY_CACHE_SIZE];
+size_t nodeDiscoveryCacheCount = 0;
 
 #if defined(ESP8266) || defined(ESP32)
 ICACHE_RAM_ATTR
@@ -116,6 +150,9 @@ ICACHE_RAM_ATTR
 void onLoRaPacketReceived() {
   ++loraPacketIrqCount;
 }
+
+bool publishMQTT(const char* topic, const char* payload, bool retained);
+void publishNodeSensorDiscoveries(const char* nodeId, const char* stateTopic, const char* nodePayload);
 
 bool appendChar(char* buffer, size_t bufferSize, size_t& offset, char value) {
   if (offset + 1 >= bufferSize) {
@@ -193,6 +230,181 @@ bool buildLoRaPayloadJson(char* buffer, size_t bufferSize, const String& incomin
            lastPacketRSSI,
            lastPacketSNR,
            static_cast<unsigned long>(loraPacketsReceived));
+}
+
+bool isValidNodeId(const char* nodeId) {
+  if (nodeId == nullptr) {
+    return false;
+  }
+
+  size_t length = strlen(nodeId);
+  if (length == 0 || length > 32) {
+    return false;
+  }
+
+  for (size_t i = 0; i < length; ++i) {
+    char c = nodeId[i];
+    bool valid = (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9') ||
+                 c == '-';
+    if (!valid) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool buildNodeStateTopic(char* buffer, size_t bufferSize, const char* nodeId) {
+  int written = snprintf(buffer, bufferSize, "%s/lora/%s/state", MQTT_TOPIC_PREFIX, nodeId);
+  return written >= 0 && static_cast<size_t>(written) < bufferSize;
+}
+
+void nodeIdToEntityId(char* buffer, size_t bufferSize, const char* nodeId) {
+  size_t offset = 0;
+  if (bufferSize == 0) {
+    return;
+  }
+
+  for (size_t i = 0; nodeId[i] != '\0' && offset + 1 < bufferSize; ++i) {
+    buffer[offset++] = nodeId[i] == '-' ? '_' : nodeId[i];
+  }
+  buffer[offset] = '\0';
+}
+
+void nodeIdToDisplayName(char* buffer, size_t bufferSize, const char* nodeId) {
+  size_t offset = 0;
+  bool capitalizeNext = true;
+  if (bufferSize == 0) {
+    return;
+  }
+
+  for (size_t i = 0; nodeId[i] != '\0' && offset + 1 < bufferSize; ++i) {
+    char c = nodeId[i];
+    if (c == '-') {
+      c = ' ';
+      capitalizeNext = true;
+    } else if (capitalizeNext && c >= 'a' && c <= 'z') {
+      c = static_cast<char>(c - 'a' + 'A');
+      capitalizeNext = false;
+    } else {
+      capitalizeNext = false;
+    }
+    buffer[offset++] = c;
+  }
+  buffer[offset] = '\0';
+}
+
+bool nodeDiscoveryAlreadyPublished(const char* nodeId, const char* field) {
+  for (size_t i = 0; i < nodeDiscoveryCacheCount; ++i) {
+    if (strcmp(nodeDiscoveryCache[i].nodeId, nodeId) == 0 &&
+        strcmp(nodeDiscoveryCache[i].field, field) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void rememberNodeDiscovery(const char* nodeId, const char* field) {
+  if (nodeDiscoveryCacheCount >= LORA_NODE_DISCOVERY_CACHE_SIZE) {
+    Serial.println("Node discovery cache full");
+    return;
+  }
+
+  NodeDiscoveryCacheEntry& entry = nodeDiscoveryCache[nodeDiscoveryCacheCount++];
+  strlcpy(entry.nodeId, nodeId, sizeof(entry.nodeId));
+  entry.field = field;
+}
+
+bool buildNodeDiscoveryIds(
+  const char* nodeId,
+  const char* objectSuffix,
+  char* nodeEntityId,
+  size_t nodeEntityIdSize,
+  char* objectId,
+  size_t objectIdSize,
+  char* deviceIdentifier,
+  size_t deviceIdentifierSize) {
+
+  nodeIdToEntityId(nodeEntityId, nodeEntityIdSize, nodeId);
+  int objectWritten = snprintf(objectId, objectIdSize, "lora_%s_%s", nodeEntityId, objectSuffix);
+  int deviceWritten = snprintf(deviceIdentifier, deviceIdentifierSize, "lora_%s", nodeEntityId);
+
+  return objectWritten >= 0 &&
+         static_cast<size_t>(objectWritten) < objectIdSize &&
+         deviceWritten >= 0 &&
+         static_cast<size_t>(deviceWritten) < deviceIdentifierSize;
+}
+
+bool buildNodeStatePayload(char* buffer, size_t bufferSize, const String& incoming, char* nodeId, size_t nodeIdSize) {
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, incoming);
+  if (error) {
+    Serial.print("LoRa payload JSON parse failed: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+
+  JsonVariant nodeIdValue = doc["node_id"];
+  if (!nodeIdValue.is<const char*>()) {
+    Serial.println("LoRa payload missing string node_id");
+    return false;
+  }
+
+  const char* parsedNodeId = nodeIdValue.as<const char*>();
+  if (!isValidNodeId(parsedNodeId)) {
+    Serial.print("LoRa payload invalid node_id: ");
+    Serial.println(parsedNodeId);
+    return false;
+  }
+
+  if (strlcpy(nodeId, parsedNodeId, nodeIdSize) >= nodeIdSize) {
+    Serial.println("LoRa payload node_id too large");
+    return false;
+  }
+
+  doc["rssi_dbm"] = lastPacketRSSI;
+  doc["snr_db"] = lastPacketSNR;
+  doc["gateway_packet_count"] = loraPacketsReceived;
+  if (doc["temperature_c"].is<float>() && !doc["temperature_f"].is<float>()) {
+    float temperatureC = doc["temperature_c"].as<float>();
+    doc["temperature_f"] = (temperatureC * 9.0F / 5.0F) + 32.0F;
+  }
+
+  size_t written = serializeJson(doc, buffer, bufferSize);
+  return written > 0 && written < bufferSize;
+}
+
+bool publishLoRaPacket(
+  const String& incoming,
+  bool nodeStateReady,
+  const char* nodeId,
+  const char* nodeTopic,
+  const char* nodePayload) {
+
+  bool rawPublished = false;
+  char rawPayload[LORA_MQTT_PAYLOAD_BUFFER_SIZE];
+
+  if (!buildLoRaPayloadJson(rawPayload, sizeof(rawPayload), incoming)) {
+    ++mqttPublishFailures;
+    Serial.println("MQTT raw publish skipped: LoRa payload JSON too large");
+  } else {
+    rawPublished = publishMQTT(GATEWAY_MQTT_TOPIC_RX, rawPayload, false);
+    Serial.println(rawPublished ? "MQTT raw publish OK" : "MQTT raw publish FAIL");
+  }
+
+  if (!nodeStateReady) {
+    Serial.println("MQTT per-node publish skipped: invalid LoRa payload");
+    return false;
+  }
+
+  bool nodePublished = publishMQTT(nodeTopic, nodePayload, false);
+  Serial.println(nodePublished ? "MQTT per-node publish OK" : "MQTT per-node publish FAIL");
+  if (nodePublished) {
+    publishNodeSensorDiscoveries(nodeId, nodeTopic, nodePayload);
+  }
+  return rawPublished && nodePublished;
 }
 
 bool buildTopic(char* buffer, size_t bufferSize, const char* suffix = nullptr) {
@@ -299,6 +511,107 @@ bool publishSensorDiscovery(
   }
 
   return publishMQTT(topic, payload, true);
+}
+
+bool publishNodeSensorDiscovery(
+  const char* nodeId,
+  const char* stateTopic,
+  const NodeSensorDiscoveryDef& sensor) {
+
+  char nodeEntityId[NODE_DISCOVERY_ID_BUFFER_SIZE];
+  char objectId[NODE_DISCOVERY_ID_BUFFER_SIZE];
+  char deviceIdentifier[NODE_DISCOVERY_ID_BUFFER_SIZE];
+  char deviceName[NODE_DISCOVERY_ID_BUFFER_SIZE];
+  char topic[MQTT_DISCOVERY_TOPIC_BUFFER_SIZE];
+  char payload[MQTT_DISCOVERY_PAYLOAD_BUFFER_SIZE];
+  size_t offset = 0;
+
+  if (!buildNodeDiscoveryIds(
+        nodeId,
+        sensor.objectSuffix,
+        nodeEntityId,
+        sizeof(nodeEntityId),
+        objectId,
+        sizeof(objectId),
+        deviceIdentifier,
+        sizeof(deviceIdentifier))) {
+    ++mqttPublishFailures;
+    Serial.println("Node discovery skipped: identifier too large");
+    return false;
+  }
+
+  nodeIdToDisplayName(deviceName, sizeof(deviceName), nodeId);
+  int written = snprintf(topic, sizeof(topic), "%s/sensor/%s/%s/config", HA_DISCOVERY_PREFIX, deviceIdentifier, sensor.objectSuffix);
+
+  bool ok = written >= 0 && static_cast<size_t>(written) < sizeof(topic) &&
+            appendFormatted(
+              payload,
+              sizeof(payload),
+              offset,
+              "{\"name\":\"%s\",\"unique_id\":\"%s\",\"state_topic\":\"%s\",\"value_template\":\"{{ value_json.%s }}\",\"availability_topic\":\"%s\",\"payload_available\":\"%s\",\"payload_not_available\":\"%s\"",
+              sensor.name,
+              objectId,
+              stateTopic,
+              sensor.field,
+              GATEWAY_MQTT_TOPIC_AVAILABILITY,
+              GATEWAY_AVAILABILITY_ONLINE,
+              GATEWAY_AVAILABILITY_OFFLINE);
+
+  if (ok && sensor.unit[0] != '\0') {
+    ok = appendFormatted(payload, sizeof(payload), offset, ",\"unit_of_measurement\":\"%s\"", sensor.unit);
+  }
+  if (ok && sensor.deviceClass[0] != '\0') {
+    ok = appendFormatted(payload, sizeof(payload), offset, ",\"device_class\":\"%s\"", sensor.deviceClass);
+  }
+  if (ok && sensor.stateClass[0] != '\0') {
+    ok = appendFormatted(payload, sizeof(payload), offset, ",\"state_class\":\"%s\"", sensor.stateClass);
+  }
+
+  ok = ok && appendFormatted(
+    payload,
+    sizeof(payload),
+    offset,
+    ",\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\",\"manufacturer\":\"Little Lodge LoRa\"}}",
+    deviceIdentifier,
+    deviceName);
+
+  if (!ok) {
+    ++mqttPublishFailures;
+    Serial.print("Node discovery payload too large: ");
+    Serial.println(objectId);
+    return false;
+  }
+
+  if (publishMQTT(topic, payload, true)) {
+    rememberNodeDiscovery(nodeId, sensor.field);
+    Serial.print("Node discovery published: ");
+    Serial.println(objectId);
+    return true;
+  }
+
+  Serial.print("Node discovery publish failed: ");
+  Serial.println(objectId);
+  return false;
+}
+
+void publishNodeSensorDiscoveries(const char* nodeId, const char* stateTopic, const char* nodePayload) {
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, nodePayload);
+  if (error) {
+    Serial.print("Node discovery parse failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  for (const NodeSensorDiscoveryDef& sensor : NODE_SENSOR_DISCOVERY) {
+    if (!doc[sensor.field].is<float>() && !doc[sensor.field].is<long>()) {
+      continue;
+    }
+    if (nodeDiscoveryAlreadyPublished(nodeId, sensor.field)) {
+      continue;
+    }
+    publishNodeSensorDiscovery(nodeId, stateTopic, sensor);
+  }
 }
 
 bool publishBinarySensorDiscovery(
@@ -412,7 +725,7 @@ void publishHealth() {
     return;
   }
 
-  char payload[768];
+  char payload[896];
   char temperatureJson[16];
   String ip = (wifiReady && WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
   int wifiRSSI = (wifiReady && WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
@@ -431,7 +744,7 @@ void publishHealth() {
   int written = snprintf(
     payload,
     sizeof(payload),
-    "{\"device_id\":\"%s\",\"boot_id\":%lu,\"reset_reason\":%d,\"uptime_s\":%lu,\"wifi_connected\":%s,\"wifi_rssi_dbm\":%d,\"ip\":\"%s\",\"mqtt_connected\":%s,\"mqtt_topics_ready\":%s,\"display_ready\":%s,\"lora_ready\":%s,\"last_lora_state\":%d,\"packets_received\":%lu,\"decode_failures\":%lu,\"rx_failures\":%lu,\"lora_irq_overruns\":%lu,\"lora_recovery_attempts\":%lu,\"mqtt_publish_successes\":%lu,\"mqtt_publish_failures\":%lu,\"last_packet_rssi_dbm\":%.1f,\"last_packet_snr_db\":%.1f,\"temperature_available\":%s,\"temperature_c\":%s,\"free_heap\":%lu,\"min_free_heap\":%lu}",
+    "{\"device_id\":\"%s\",\"boot_id\":%lu,\"reset_reason\":%d,\"uptime_s\":%lu,\"wifi_connected\":%s,\"wifi_rssi_dbm\":%d,\"ip\":\"%s\",\"mqtt_connected\":%s,\"mqtt_topics_ready\":%s,\"display_ready\":%s,\"lora_ready\":%s,\"last_lora_state\":%d,\"packets_received\":%lu,\"decode_failures\":%lu,\"payload_parse_failures\":%lu,\"rx_failures\":%lu,\"lora_irq_overruns\":%lu,\"lora_recovery_attempts\":%lu,\"mqtt_publish_successes\":%lu,\"mqtt_publish_failures\":%lu,\"last_packet_rssi_dbm\":%.1f,\"last_packet_snr_db\":%.1f,\"temperature_available\":%s,\"temperature_c\":%s,\"free_heap\":%lu,\"min_free_heap\":%lu}",
     DEVICE_ID,
     static_cast<unsigned long>(bootId),
     static_cast<int>(esp_reset_reason()),
@@ -446,6 +759,7 @@ void publishHealth() {
     lastLoRaRxState,
     static_cast<unsigned long>(loraPacketsReceived),
     static_cast<unsigned long>(loraDecodeFailures),
+    static_cast<unsigned long>(loraPayloadParseFailures),
     static_cast<unsigned long>(loraRxFailures),
     static_cast<unsigned long>(loraPacketIrqOverruns),
     static_cast<unsigned long>(loraRecoveryAttempts),
@@ -743,20 +1057,23 @@ void loop() {
       Serial.print(" dBm | SNR: ");
       Serial.println(lastPacketSNR);
 
-      if (mqttReady) {
-        char payload[LORA_MQTT_PAYLOAD_BUFFER_SIZE];
-        bool payloadReady = buildLoRaPayloadJson(payload, sizeof(payload), incoming);
+      char nodeId[33];
+      char nodeTopic[LORA_NODE_TOPIC_BUFFER_SIZE];
+      char nodePayload[LORA_NODE_STATE_PAYLOAD_BUFFER_SIZE];
+      bool nodeStateReady = buildNodeStatePayload(nodePayload, sizeof(nodePayload), incoming, nodeId, sizeof(nodeId));
+      if (!nodeStateReady) {
+        ++loraPayloadParseFailures;
+      } else if (!buildNodeStateTopic(nodeTopic, sizeof(nodeTopic), nodeId)) {
+        nodeStateReady = false;
+        ++mqttPublishFailures;
+        Serial.println("MQTT per-node publish skipped: node topic too large");
+      }
 
-        if (!payloadReady) {
-          ++mqttPublishFailures;
-          Serial.println("MQTT publish skipped: LoRa payload JSON too large");
-          showStatus("LoRa RX", incoming.substring(0, 20).c_str(), "Payload too large");
-        } else if (publishMQTT(GATEWAY_MQTT_TOPIC_RX, payload)) {
-          Serial.println("MQTT publish OK");
+      if (mqttReady) {
+        if (publishLoRaPacket(incoming, nodeStateReady, nodeId, nodeTopic, nodePayload)) {
           showStatus("LoRa RX", incoming.substring(0, 20).c_str(), "Published MQTT");
         } else {
-          Serial.println("MQTT publish FAIL");
-          showStatus("LoRa RX", incoming.substring(0, 20).c_str(), "Publish FAIL");
+          showStatus("LoRa RX", incoming.substring(0, 20).c_str(), "Check payload");
         }
       } else {
         Serial.println("MQTT unavailable for publish");

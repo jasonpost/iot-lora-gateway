@@ -128,13 +128,15 @@ LoRa settings in the current firmware:
 LoRa transmitter payload standard:
 
 - Transmitters should use the same LoRa radio settings listed above.
-- The over-the-air LoRa payload is treated as a UTF-8/text string by the gateway.
-- The gateway does not parse the LoRa payload as JSON.
-- JSON is used for the MQTT message published by the gateway.
-- If a transmitter sends JSON text, it will be preserved as text inside the
-  MQTT `payload` field, with JSON escaping applied as needed.
+- Transmitters should send compact JSON over LoRa.
+- Every transmitter JSON payload should include a valid `node_id`.
+- The gateway publishes every received LoRa packet to the raw/debug MQTT topic.
+- The gateway also parses valid transmitter JSON and publishes it to a per-node
+  state topic.
+- If a payload includes `temperature_c`, the gateway adds `temperature_f` to the
+  per-node state payload.
 - Keep transmitter payloads compact. The gateway skips MQTT publication if the
-  escaped MQTT JSON envelope would exceed its receive publish buffer.
+  MQTT JSON payload would exceed its publish buffers.
 
 MQTT behavior in the current firmware:
 
@@ -145,13 +147,37 @@ MQTT behavior in the current firmware:
 - Publishes `gateway alive` every 30 seconds while connected
 - Publishes retained gateway health JSON every 30 seconds
 - Publishes retained BME280 temperature JSON every 60 seconds when the sensor is present
-- Publishes each received LoRa payload with RSSI, SNR, and packet count metadata
+- Publishes each received LoRa payload to the raw/debug topic with RSSI, SNR,
+  and packet count metadata
+- Publishes valid transmitter JSON to `<MQTT_TOPIC_PREFIX>/lora/<node_id>/state`
+  with RSSI, SNR, and gateway packet count metadata
+- Publishes retained Home Assistant MQTT discovery configs for known numeric
+  per-node fields when they first appear
+- Increments `payload_parse_failures` when a LoRa payload is not valid JSON or
+  has a missing/invalid `node_id`
 
 Example LoRa receive payload:
 
 ```json
 {"payload":"sensor payload","rssi_dbm":-78.5,"snr_db":8.2,"packet_count":42}
 ```
+
+Example per-node state payload:
+
+```json
+{"node_id":"barn-01","type":"state","temperature_c":21.7,"battery_v":3.88,"rssi_dbm":-78.5,"snr_db":8.2,"gateway_packet_count":42,"temperature_f":71.06}
+```
+
+Per-node Home Assistant discovery currently supports these numeric fields:
+
+- `temperature_c`
+- `temperature_f`
+- `humidity_pct`
+- `battery_v`
+- `rssi_dbm`
+- `snr_db`
+- `gateway_packet_count`
+- `seq`
 
 Example gateway health fields:
 
@@ -166,6 +192,7 @@ Example gateway health fields:
 - `last_lora_state`
 - `packets_received`
 - `decode_failures`
+- `payload_parse_failures`
 - `rx_failures`
 - `mqtt_publish_successes`
 - `mqtt_publish_failures`

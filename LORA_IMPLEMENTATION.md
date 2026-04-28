@@ -14,10 +14,90 @@ that exists today.
 - Support future MQTT-to-LoRa commands without requiring battery devices to stay
   awake continuously.
 
+## Transmitter Authoring Rules
+
+Use this section as the short version when building a new LoRa transmitter.
+
+- Send one compact JSON object per LoRa packet.
+- Always include `node_id`.
+- Use `type: "state"` for normal sensor reports.
+- Use `seq` when possible so missed packets can be detected.
+- Use `battery_v` for battery voltage when available.
+- Use stable snake_case field names.
+- Include units in field names where the unit is not obvious, such as
+  `temperature_c`, `humidity_pct`, `pressure_psi`, `distance_mm`, or
+  `battery_v`.
+- Send one packet with all readings from the current wake cycle.
+- Keep payloads small.
+- Do not include MQTT topics, Home Assistant discovery config, Wi-Fi settings,
+  or gateway-specific routing details in transmitter firmware.
+
+Minimum valid transmitter payload:
+
+```json
+{
+  "node_id": "barn-01",
+  "type": "state"
+}
+```
+
+Recommended baseline transmitter payload:
+
+```json
+{
+  "node_id": "barn-01",
+  "type": "state",
+  "seq": 1,
+  "battery_v": 3.88
+}
+```
+
+Example environmental transmitter:
+
+```json
+{
+  "node_id": "barn-01",
+  "type": "state",
+  "seq": 44,
+  "battery_v": 3.88,
+  "temperature_c": 21.7,
+  "humidity_pct": 48.2
+}
+```
+
+Example water/pressure transmitter:
+
+```json
+{
+  "node_id": "well-house",
+  "type": "state",
+  "seq": 12,
+  "battery_v": 3.71,
+  "water_detected": false,
+  "pressure_psi": 42.5
+}
+```
+
+Example gate/contact transmitter:
+
+```json
+{
+  "node_id": "gate-01",
+  "type": "state",
+  "seq": 88,
+  "battery_v": 3.92,
+  "open": true,
+  "tamper_detected": false
+}
+```
+
+Transmitters should send `temperature_c`, not `temperature_f`. The gateway
+derives `temperature_f` when `temperature_c` is present.
+
 ## Current Gateway Behavior
 
 The current firmware is receive-only. It receives a LoRa packet as text and
-publishes a JSON MQTT envelope to:
+publishes a raw/debug JSON MQTT envelope to:
 
 ```text
 <MQTT_TOPIC_PREFIX>/lora-gateway/rx
@@ -34,9 +114,17 @@ Current MQTT payload shape:
 }
 ```
 
-The current gateway does not parse the transmitter payload as JSON. If a
-transmitter sends JSON text today, that JSON is preserved as an escaped string
-inside the `payload` field.
+The current gateway also parses valid transmitter JSON with a valid `node_id`
+and publishes an enriched per-node state payload to:
+
+```text
+<MQTT_TOPIC_PREFIX>/lora/<node_id>/state
+```
+
+Invalid JSON, missing `node_id`, or invalid `node_id` values are still visible
+on the raw/debug topic when MQTT is connected. They are not published to a
+per-node state topic, and `payload_parse_failures` is incremented in gateway
+health.
 
 ## Target Transmitter Payload Standard
 
@@ -73,16 +161,15 @@ Sensor fields are flexible. A node may include one reading or many readings in
 the same packet. For example, one transmitter can report temperature, humidity,
 battery voltage, and door state together.
 
-## Target MQTT Topic Layout
+## MQTT Topic Layout
 
-The gateway should keep the raw receive topic:
+The gateway keeps the raw receive topic:
 
 ```text
 <MQTT_TOPIC_PREFIX>/lora-gateway/rx
 ```
 
-The gateway should also parse `node_id` and publish each node to its own state
-topic:
+The gateway also parses `node_id` and publishes each node to its own state topic:
 
 ```text
 <MQTT_TOPIC_PREFIX>/lora/<node_id>/state
@@ -107,6 +194,7 @@ add gateway radio metadata:
   "rx_window_ms": 1000,
   "battery_v": 3.88,
   "temperature_c": 21.7,
+  "temperature_f": 71.06,
   "humidity_pct": 48.2,
   "rssi_dbm": -78.5,
   "snr_db": 8.2,
@@ -116,6 +204,9 @@ add gateway radio metadata:
 
 Keep `node_id` in the payload even though it is also present in the topic. This
 makes logs, retained messages, automations, and exports self-describing.
+
+If a transmitter includes `temperature_c`, the gateway adds `temperature_f` to
+the per-node MQTT state payload.
 
 ## Home Assistant Discovery
 
@@ -148,12 +239,22 @@ Example discovery payload for a temperature entity:
 }
 ```
 
-Discovery can be implemented in phases:
+Phase 1 numeric discovery is implemented for:
 
-1. Publish per-node state topics with no HA discovery.
-2. Add discovery for known/common fields such as `battery_v`, `temperature_c`,
-   `humidity_pct`, `door_open`, and `water_detected`.
-3. Add optional node metadata if transmitters include fields such as
+- `temperature_c`
+- `temperature_f`
+- `humidity_pct`
+- `battery_v`
+- `rssi_dbm`
+- `snr_db`
+- `gateway_packet_count`
+- `seq`
+
+Future discovery phases:
+
+1. Add binary fields such as `door_open`, `water_detected`, and
+   `motion_detected`.
+2. Add optional node metadata if transmitters include fields such as
    `device_name` or `model`.
 
 ## Future Downlink Commands

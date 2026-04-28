@@ -223,9 +223,10 @@ bool setupMQTTTopics() {
 
 bool consumeLoRaPacketIrq() {
   noInterrupts();
-  uint32_t pending = loraPacketIrqCount - loraPacketIrqsHandled;
+  uint32_t observed = loraPacketIrqCount;
+  uint32_t pending = observed - loraPacketIrqsHandled;
   if (pending > 0) {
-    ++loraPacketIrqsHandled;
+    loraPacketIrqsHandled = observed;
   }
   interrupts();
 

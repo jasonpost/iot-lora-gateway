@@ -44,6 +44,7 @@ powered off.
 - [platformio.ini](platformio.ini)
 - [src/main.cpp](src/main.cpp)
 - [src/secrets.example.h](src/secrets.example.h)
+- [LORA_IMPLEMENTATION.md](LORA_IMPLEMENTATION.md)
 
 ## Secrets Setup
 
@@ -123,6 +124,17 @@ LoRa settings in the current firmware:
 - Bandwidth: `125.0 kHz`
 - Coding rate: `4/7`
 - Sync word: `0x12`
+
+LoRa transmitter payload standard:
+
+- Transmitters should use the same LoRa radio settings listed above.
+- The over-the-air LoRa payload is treated as a UTF-8/text string by the gateway.
+- The gateway does not parse the LoRa payload as JSON.
+- JSON is used for the MQTT message published by the gateway.
+- If a transmitter sends JSON text, it will be preserved as text inside the
+  MQTT `payload` field, with JSON escaping applied as needed.
+- Keep transmitter payloads compact. The gateway skips MQTT publication if the
+  escaped MQTT JSON envelope would exceed its receive publish buffer.
 
 MQTT behavior in the current firmware:
 

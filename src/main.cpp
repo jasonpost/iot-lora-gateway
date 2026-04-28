@@ -14,6 +14,8 @@
 static constexpr int SCREEN_WIDTH = 128;
 static constexpr int SCREEN_HEIGHT = 64;
 static constexpr size_t LORA_MQTT_PAYLOAD_BUFFER_SIZE = 512;
+static constexpr size_t MQTT_DISCOVERY_TOPIC_BUFFER_SIZE = 160;
+static constexpr size_t MQTT_DISCOVERY_PAYLOAD_BUFFER_SIZE = 768;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, PIN_OLED_RST);
 Adafruit_BME280 bme;
@@ -51,6 +53,8 @@ const BinarySensorDiscoveryDef BINARY_SENSOR_DISCOVERY[] = {
   {"mqtt_connected", "MQTT Connected", "{{ 'ON' if value_json.mqtt_connected else 'OFF' }}", "connectivity"},
   {"lora_ready", "LoRa Ready", "{{ 'ON' if value_json.lora_ready else 'OFF' }}", "connectivity"},
   {"temperature_available", "Temperature Sensor", "{{ 'ON' if value_json.temperature_available else 'OFF' }}", "connectivity"},
+  {"display_ready", "OLED Display", "{{ 'ON' if value_json.display_ready else 'OFF' }}", "connectivity"},
+  {"topics_ready", "MQTT Topics", "{{ 'ON' if value_json.mqtt_topics_ready else 'OFF' }}", "connectivity"},
 };
 
 const SensorDiscoveryDef SENSOR_DISCOVERY[] = {
@@ -60,10 +64,13 @@ const SensorDiscoveryDef SENSOR_DISCOVERY[] = {
   {"decode_failures", "LoRa Decode Failures", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.decode_failures }}", "", "", "total_increasing"},
   {"rx_failures", "LoRa RX Failures", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.rx_failures }}", "", "", "total_increasing"},
   {"mqtt_publish_failures", "MQTT Publish Failures", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.mqtt_publish_failures }}", "", "", "total_increasing"},
+  {"lora_irq_overruns", "LoRa IRQ Overruns", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.lora_irq_overruns }}", "", "", "total_increasing"},
+  {"lora_recovery_attempts", "LoRa Recovery Attempts", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.lora_recovery_attempts }}", "", "", "total_increasing"},
   {"last_packet_rssi", "Last LoRa RSSI", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.last_packet_rssi_dbm }}", "dBm", "signal_strength", "measurement"},
   {"last_packet_snr", "Last LoRa SNR", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.last_packet_snr_db }}", "dB", "", "measurement"},
   {"free_heap", "Free Heap", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.free_heap }}", "B", "data_size", "measurement"},
-  {"temperature", "Attic Temperature", GATEWAY_MQTT_TOPIC_TEMPERATURE, "{{ value_json.temperature_c }}", "°C", "temperature", "measurement"},
+  {"min_free_heap", "Minimum Free Heap", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.min_free_heap }}", "B", "data_size", "measurement"},
+  {"temperature", "Attic Temperature", GATEWAY_MQTT_TOPIC_TEMPERATURE, "{{ value_json.temperature_c }}", "C", "temperature", "measurement"},
   {"humidity", "Attic Humidity", GATEWAY_MQTT_TOPIC_TEMPERATURE, "{{ value_json.humidity_percent }}", "%", "humidity", "measurement"},
   {"pressure", "Attic Pressure", GATEWAY_MQTT_TOPIC_TEMPERATURE, "{{ value_json.pressure_hpa }}", "hPa", "pressure", "measurement"},
 };
@@ -73,18 +80,23 @@ int loraInitCode = 0;
 bool wifiReady = false;
 bool mqttReady = false;
 bool mqttTopicsReady = false;
+bool displayReady = false;
 String lastLoRaMessage;
-volatile bool loraPacketReceived = false;
+volatile uint32_t loraPacketIrqCount = 0;
+uint32_t loraPacketIrqsHandled = 0;
+uint32_t loraPacketIrqOverruns = 0;
 unsigned long lastHeartbeatMs = 0;
 unsigned long lastHealthPublishMs = 0;
 unsigned long lastTemperaturePublishMs = 0;
 unsigned long lastDiscoveryAttemptMs = 0;
 unsigned long lastWiFiAttemptMs = 0;
 unsigned long lastMQTTAttemptMs = 0;
+unsigned long lastLoRaRecoveryAttemptMs = 0;
 int lastLoRaRxState = RADIOLIB_ERR_NONE;
 uint32_t loraPacketsReceived = 0;
 uint32_t loraDecodeFailures = 0;
 uint32_t loraRxFailures = 0;
+uint32_t loraRecoveryAttempts = 0;
 uint32_t mqttPublishSuccesses = 0;
 uint32_t mqttPublishFailures = 0;
 float lastPacketRSSI = 0.0;
@@ -92,6 +104,8 @@ float lastPacketSNR = 0.0;
 bool temperatureReady = false;
 bool homeAssistantDiscoveryPublished = false;
 bool temperatureReadOk = false;
+uint32_t bootId = 0;
+uint32_t minFreeHeap = UINT32_MAX;
 float lastTemperatureC = 0.0;
 float lastHumidityPercent = 0.0;
 float lastPressureHpa = 0.0;
@@ -100,7 +114,7 @@ float lastPressureHpa = 0.0;
 ICACHE_RAM_ATTR
 #endif
 void onLoRaPacketReceived() {
-  loraPacketReceived = true;
+  ++loraPacketIrqCount;
 }
 
 bool appendChar(char* buffer, size_t bufferSize, size_t& offset, char value) {
@@ -207,6 +221,21 @@ bool setupMQTTTopics() {
   return ok;
 }
 
+bool consumeLoRaPacketIrq() {
+  noInterrupts();
+  uint32_t pending = loraPacketIrqCount - loraPacketIrqsHandled;
+  if (pending > 0) {
+    ++loraPacketIrqsHandled;
+  }
+  interrupts();
+
+  if (pending > 1) {
+    loraPacketIrqOverruns += pending - 1;
+  }
+
+  return pending > 0;
+}
+
 bool publishMQTT(const char* topic, const char* payload, bool retained = false) {
   bool ok = mqtt.publish(topic, payload, retained);
   if (ok) {
@@ -221,10 +250,6 @@ bool publishMQTT(const char* topic, const String& payload, bool retained = false
   return publishMQTT(topic, payload.c_str(), retained);
 }
 
-String discoveryDeviceJson() {
-  return String("\"device\":{\"identifiers\":[\"") + DEVICE_ID + "\"],\"name\":\"" + DEVICE_NAME + "\"}";
-}
-
 bool publishSensorDiscovery(
   const char* objectId,
   const char* name,
@@ -234,27 +259,45 @@ bool publishSensorDiscovery(
   const char* deviceClass = "",
   const char* stateClass = "") {
 
-  String topic = String(HA_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_ID + "/" + objectId + "/config";
-  String payload = String("{\"name\":\"") + name +
-                   "\",\"unique_id\":\"" + DEVICE_ID + "_" + objectId +
-                   "\",\"state_topic\":\"" + stateTopic +
-                   "\",\"value_template\":\"" + valueTemplate +
-                   "\",\"availability_topic\":\"" + GATEWAY_MQTT_TOPIC_AVAILABILITY +
-                   "\",\"payload_available\":\"" + GATEWAY_AVAILABILITY_ONLINE +
-                   "\",\"payload_not_available\":\"" + GATEWAY_AVAILABILITY_OFFLINE + "\"";
+  char topic[MQTT_DISCOVERY_TOPIC_BUFFER_SIZE];
+  char payload[MQTT_DISCOVERY_PAYLOAD_BUFFER_SIZE];
+  size_t offset = 0;
+  int written = snprintf(topic, sizeof(topic), "%s/sensor/%s/%s/config", HA_DISCOVERY_PREFIX, DEVICE_ID, objectId);
 
-  if (unit[0] != '\0') {
-    payload += String(",\"unit_of_measurement\":\"") + unit + "\"";
+  bool ok = written >= 0 && static_cast<size_t>(written) < sizeof(topic) &&
+            appendFormatted(
+              payload,
+              sizeof(payload),
+              offset,
+              "{\"name\":\"%s\",\"unique_id\":\"%s_%s\",\"state_topic\":\"%s\",\"value_template\":\"%s\",\"availability_topic\":\"%s\",\"payload_available\":\"%s\",\"payload_not_available\":\"%s\"",
+              name,
+              DEVICE_ID,
+              objectId,
+              stateTopic,
+              valueTemplate,
+              GATEWAY_MQTT_TOPIC_AVAILABILITY,
+              GATEWAY_AVAILABILITY_ONLINE,
+              GATEWAY_AVAILABILITY_OFFLINE);
+
+  if (ok && unit[0] != '\0') {
+    ok = appendFormatted(payload, sizeof(payload), offset, ",\"unit_of_measurement\":\"%s\"", unit);
   }
-  if (deviceClass[0] != '\0') {
-    payload += String(",\"device_class\":\"") + deviceClass + "\"";
+  if (ok && deviceClass[0] != '\0') {
+    ok = appendFormatted(payload, sizeof(payload), offset, ",\"device_class\":\"%s\"", deviceClass);
   }
-  if (stateClass[0] != '\0') {
-    payload += String(",\"state_class\":\"") + stateClass + "\"";
+  if (ok && stateClass[0] != '\0') {
+    ok = appendFormatted(payload, sizeof(payload), offset, ",\"state_class\":\"%s\"", stateClass);
   }
 
-  payload += "," + discoveryDeviceJson() + "}";
-  return publishMQTT(topic.c_str(), payload, true);
+  ok = ok && appendFormatted(payload, sizeof(payload), offset, ",\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\"}}", DEVICE_ID, DEVICE_NAME);
+  if (!ok) {
+    ++mqttPublishFailures;
+    Serial.print("Discovery payload too large: ");
+    Serial.println(objectId);
+    return false;
+  }
+
+  return publishMQTT(topic, payload, true);
 }
 
 bool publishBinarySensorDiscovery(
@@ -263,22 +306,39 @@ bool publishBinarySensorDiscovery(
   const char* valueTemplate,
   const char* deviceClass = "") {
 
-  String topic = String(HA_DISCOVERY_PREFIX) + "/binary_sensor/" + DEVICE_ID + "/" + objectId + "/config";
-  String payload = String("{\"name\":\"") + name +
-                   "\",\"unique_id\":\"" + DEVICE_ID + "_" + objectId +
-                   "\",\"state_topic\":\"" + GATEWAY_MQTT_TOPIC_HEALTH +
-                   "\",\"value_template\":\"" + valueTemplate +
-                   "\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\"" +
-                   ",\"availability_topic\":\"" + GATEWAY_MQTT_TOPIC_AVAILABILITY +
-                   "\",\"payload_available\":\"" + GATEWAY_AVAILABILITY_ONLINE +
-                   "\",\"payload_not_available\":\"" + GATEWAY_AVAILABILITY_OFFLINE + "\"";
+  char topic[MQTT_DISCOVERY_TOPIC_BUFFER_SIZE];
+  char payload[MQTT_DISCOVERY_PAYLOAD_BUFFER_SIZE];
+  size_t offset = 0;
+  int written = snprintf(topic, sizeof(topic), "%s/binary_sensor/%s/%s/config", HA_DISCOVERY_PREFIX, DEVICE_ID, objectId);
 
-  if (deviceClass[0] != '\0') {
-    payload += String(",\"device_class\":\"") + deviceClass + "\"";
+  bool ok = written >= 0 && static_cast<size_t>(written) < sizeof(topic) &&
+            appendFormatted(
+              payload,
+              sizeof(payload),
+              offset,
+              "{\"name\":\"%s\",\"unique_id\":\"%s_%s\",\"state_topic\":\"%s\",\"value_template\":\"%s\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"availability_topic\":\"%s\",\"payload_available\":\"%s\",\"payload_not_available\":\"%s\"",
+              name,
+              DEVICE_ID,
+              objectId,
+              GATEWAY_MQTT_TOPIC_HEALTH,
+              valueTemplate,
+              GATEWAY_MQTT_TOPIC_AVAILABILITY,
+              GATEWAY_AVAILABILITY_ONLINE,
+              GATEWAY_AVAILABILITY_OFFLINE);
+
+  if (ok && deviceClass[0] != '\0') {
+    ok = appendFormatted(payload, sizeof(payload), offset, ",\"device_class\":\"%s\"", deviceClass);
   }
 
-  payload += "," + discoveryDeviceJson() + "}";
-  return publishMQTT(topic.c_str(), payload, true);
+  ok = ok && appendFormatted(payload, sizeof(payload), offset, ",\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\"}}", DEVICE_ID, DEVICE_NAME);
+  if (!ok) {
+    ++mqttPublishFailures;
+    Serial.print("Discovery payload too large: ");
+    Serial.println(objectId);
+    return false;
+  }
+
+  return publishMQTT(topic, payload, true);
 }
 
 bool publishHomeAssistantDiscovery() {
@@ -351,11 +411,15 @@ void publishHealth() {
     return;
   }
 
-  char payload[512];
+  char payload[768];
   char temperatureJson[16];
   String ip = (wifiReady && WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
   int wifiRSSI = (wifiReady && WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
   bool currentTemperatureOk = temperatureReady && readTemperatureSensor();
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < minFreeHeap) {
+    minFreeHeap = freeHeap;
+  }
 
   if (currentTemperatureOk) {
     snprintf(temperatureJson, sizeof(temperatureJson), "%.2f", lastTemperatureC);
@@ -366,25 +430,32 @@ void publishHealth() {
   int written = snprintf(
     payload,
     sizeof(payload),
-    "{\"device_id\":\"%s\",\"uptime_s\":%lu,\"wifi_connected\":%s,\"wifi_rssi_dbm\":%d,\"ip\":\"%s\",\"mqtt_connected\":%s,\"lora_ready\":%s,\"last_lora_state\":%d,\"packets_received\":%lu,\"decode_failures\":%lu,\"rx_failures\":%lu,\"mqtt_publish_successes\":%lu,\"mqtt_publish_failures\":%lu,\"last_packet_rssi_dbm\":%.1f,\"last_packet_snr_db\":%.1f,\"temperature_available\":%s,\"temperature_c\":%s,\"free_heap\":%lu}",
+    "{\"device_id\":\"%s\",\"boot_id\":%lu,\"reset_reason\":%d,\"uptime_s\":%lu,\"wifi_connected\":%s,\"wifi_rssi_dbm\":%d,\"ip\":\"%s\",\"mqtt_connected\":%s,\"mqtt_topics_ready\":%s,\"display_ready\":%s,\"lora_ready\":%s,\"last_lora_state\":%d,\"packets_received\":%lu,\"decode_failures\":%lu,\"rx_failures\":%lu,\"lora_irq_overruns\":%lu,\"lora_recovery_attempts\":%lu,\"mqtt_publish_successes\":%lu,\"mqtt_publish_failures\":%lu,\"last_packet_rssi_dbm\":%.1f,\"last_packet_snr_db\":%.1f,\"temperature_available\":%s,\"temperature_c\":%s,\"free_heap\":%lu,\"min_free_heap\":%lu}",
     DEVICE_ID,
+    static_cast<unsigned long>(bootId),
+    static_cast<int>(esp_reset_reason()),
     static_cast<unsigned long>(millis() / 1000UL),
     (wifiReady && WiFi.status() == WL_CONNECTED) ? "true" : "false",
     wifiRSSI,
     ip.c_str(),
     mqttReady ? "true" : "false",
+    mqttTopicsReady ? "true" : "false",
+    displayReady ? "true" : "false",
     loraReady ? "true" : "false",
     lastLoRaRxState,
     static_cast<unsigned long>(loraPacketsReceived),
     static_cast<unsigned long>(loraDecodeFailures),
     static_cast<unsigned long>(loraRxFailures),
+    static_cast<unsigned long>(loraPacketIrqOverruns),
+    static_cast<unsigned long>(loraRecoveryAttempts),
     static_cast<unsigned long>(mqttPublishSuccesses),
     static_cast<unsigned long>(mqttPublishFailures),
     lastPacketRSSI,
     lastPacketSNR,
     currentTemperatureOk ? "true" : "false",
     temperatureJson,
-    static_cast<unsigned long>(ESP.getFreeHeap()));
+    static_cast<unsigned long>(freeHeap),
+    static_cast<unsigned long>(minFreeHeap));
 
   if (written < 0 || static_cast<size_t>(written) >= sizeof(payload)) {
     ++mqttPublishFailures;
@@ -419,6 +490,10 @@ void setupTemperatureSensor() {
 }
 
 void showStatus(const char* line1, const char* line2 = "", const char* line3 = "") {
+  if (!displayReady) {
+    return;
+  }
+
   display.clearDisplay();
   display.setCursor(0, 0);
   display.println(line1);
@@ -428,15 +503,25 @@ void showStatus(const char* line1, const char* line2 = "", const char* line3 = "
 }
 
 void setupLoRa() {
+  loraReady = false;
   loraSPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
 
   loraInitCode = radio.begin(LORA_FREQUENCY_MHZ);
   if (loraInitCode == RADIOLIB_ERR_NONE) {
-    radio.setOutputPower(LORA_OUTPUT_POWER_DBM);
-    radio.setSpreadingFactor(LORA_SPREADING_FACTOR);
-    radio.setBandwidth(LORA_BANDWIDTH_KHZ);
-    radio.setCodingRate(LORA_CODING_RATE);
-    radio.setSyncWord(LORA_SYNC_WORD);
+    int configState = radio.setOutputPower(LORA_OUTPUT_POWER_DBM);
+    if (configState == RADIOLIB_ERR_NONE) configState = radio.setSpreadingFactor(LORA_SPREADING_FACTOR);
+    if (configState == RADIOLIB_ERR_NONE) configState = radio.setBandwidth(LORA_BANDWIDTH_KHZ);
+    if (configState == RADIOLIB_ERR_NONE) configState = radio.setCodingRate(LORA_CODING_RATE);
+    if (configState == RADIOLIB_ERR_NONE) configState = radio.setSyncWord(LORA_SYNC_WORD);
+
+    if (configState != RADIOLIB_ERR_NONE) {
+      loraInitCode = configState;
+      lastLoRaRxState = configState;
+      Serial.print("LoRa config failed: ");
+      Serial.println(configState);
+      return;
+    }
+
     radio.setPacketReceivedAction(onLoRaPacketReceived);
 
     int receiveState = radio.startReceive();
@@ -450,9 +535,21 @@ void setupLoRa() {
       Serial.println(receiveState);
     }
   } else {
+    lastLoRaRxState = loraInitCode;
     Serial.print("LoRa init failed: ");
     Serial.println(loraInitCode);
   }
+}
+
+void recoverLoRa(unsigned long now) {
+  if (loraReady || now - lastLoRaRecoveryAttemptMs < LORA_RECOVERY_RETRY_MS) {
+    return;
+  }
+
+  lastLoRaRecoveryAttemptMs = now;
+  ++loraRecoveryAttempts;
+  Serial.println("LoRa recovery attempt");
+  setupLoRa();
 }
 
 void connectWiFi() {
@@ -529,6 +626,8 @@ void serviceConnectivity(unsigned long now) {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  bootId = esp_random();
+  minFreeHeap = ESP.getFreeHeap();
 
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
@@ -548,21 +647,18 @@ void setup() {
   Serial.println("Heltec V4 bring-up");
   Serial.println("Serial OK");
   mqtt.setBufferSize(MQTT_BUFFER_SIZE);
+  mqtt.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
   mqttTopicsReady = setupMQTTTopics();
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
     Serial.println("OLED init failed");
-    for (;;) {
-      digitalWrite(PIN_LED, HIGH);
-      delay(150);
-      digitalWrite(PIN_LED, LOW);
-      delay(150);
-    }
+  } else {
+    displayReady = true;
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    Serial.println("OLED OK");
   }
 
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  Serial.println("OLED OK");
   setupTemperatureSensor();
   setupLoRa();
   connectWiFi();
@@ -615,17 +711,30 @@ void loop() {
     }
   }
 
-  if (loraReady && loraPacketReceived) {
-    loraPacketReceived = false;
+  recoverLoRa(now);
+
+  if (loraReady && consumeLoRaPacketIrq()) {
     String incoming;
     int state = radio.readData(incoming);
+    float packetRSSI = radio.getRSSI();
+    float packetSNR = radio.getSNR();
+    int receiveState = radio.startReceive();
+    if (receiveState != RADIOLIB_ERR_NONE) {
+      loraReady = false;
+      loraInitCode = receiveState;
+      lastLoRaRecoveryAttemptMs = now;
+      lastLoRaRxState = receiveState;
+      ++loraRxFailures;
+      Serial.print("LoRa RX restart failed: ");
+      Serial.println(receiveState);
+    }
 
     if (state == RADIOLIB_ERR_NONE) {
       lastLoRaRxState = state;
       lastLoRaMessage = incoming;
       ++loraPacketsReceived;
-      lastPacketRSSI = radio.getRSSI();
-      lastPacketSNR = radio.getSNR();
+      lastPacketRSSI = packetRSSI;
+      lastPacketSNR = packetSNR;
       Serial.print("LoRa RX: ");
       Serial.println(incoming);
       Serial.print("RSSI: ");
@@ -662,14 +771,6 @@ void loop() {
       ++loraRxFailures;
       Serial.print("LoRa RX failed: ");
       Serial.println(state);
-    }
-
-    int receiveState = radio.startReceive();
-    if (receiveState != RADIOLIB_ERR_NONE) {
-      lastLoRaRxState = receiveState;
-      ++loraRxFailures;
-      Serial.print("LoRa RX restart failed: ");
-      Serial.println(receiveState);
     }
   }
 

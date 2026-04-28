@@ -143,6 +143,8 @@ Example LoRa receive payload:
 
 Example gateway health fields:
 
+- `boot_id`
+- `reset_reason`
 - `uptime_s`
 - `wifi_connected`
 - `wifi_rssi_dbm`
@@ -160,6 +162,10 @@ Example gateway health fields:
 - `temperature_available`
 - `temperature_c`
 - `free_heap`
+- `min_free_heap`
+
+Counter-style health fields are per boot. Use `boot_id` and `reset_reason` to
+distinguish a reset from a true counter rollback in Home Assistant history.
 
 Temperature behavior:
 

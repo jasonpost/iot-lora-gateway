@@ -26,11 +26,13 @@ const unsigned long WIFI_RETRY_MS = 15000;
 
 
 const uint16_t MQTT_BUFFER_SIZE = 1536;
+const uint16_t MQTT_SOCKET_TIMEOUT_S = 2;
 const unsigned long MQTT_HEARTBEAT_MS = 30000;
 const unsigned long MQTT_HEALTH_PUBLISH_MS = 30000;
 const unsigned long MQTT_TEMPERATURE_PUBLISH_MS = 60000;
 const unsigned long MQTT_DISCOVERY_RETRY_MS = 30000;
 const unsigned long MQTT_RETRY_MS = 5000;
+const unsigned long LORA_RECOVERY_RETRY_MS = 10000;
 
 const char* DEVICE_ID = "iot_lora_gateway";
 const char* DEVICE_NAME = "IoT LoRa Gateway";

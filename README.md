@@ -65,18 +65,32 @@ const uint16_t MQTT_PORT = 1883;
 const char* MQTT_CLIENT_ID = "iot-lora-gateway";
 const char* MQTT_USER = "...";
 const char* MQTT_PASS = "...";
+const char* MQTT_TOPIC_PREFIX = "...";
 ```
 
 Non-secret gateway settings, including MQTT topics and publish intervals, live in
 `src/config.h`.
 
+## MQTT Security
+
+The default example uses plain MQTT on port `1883`, which is appropriate only for
+a trusted local network. For production use, keep the gateway on a segmented IoT
+network when possible and scope the MQTT user to only the topics it needs:
+
+- publish/write: `<MQTT_TOPIC_PREFIX>/lora-gateway/#`
+- publish/write: `homeassistant/+/iot_lora_gateway/#`
+- no subscribe permissions unless future firmware needs commands
+
+If the broker is reachable from outside the trusted LAN, use MQTT over TLS with
+server certificate validation and update the firmware to use `WiFiClientSecure`.
+
 Default MQTT topics:
 
-- `littlelodge/lora-gateway/status`
-- `littlelodge/lora-gateway/availability`
-- `littlelodge/lora-gateway/health`
-- `littlelodge/lora-gateway/rx`
-- `littlelodge/lora-gateway/temperature`
+- `<MQTT_TOPIC_PREFIX>/lora-gateway/status`
+- `<MQTT_TOPIC_PREFIX>/lora-gateway/availability`
+- `<MQTT_TOPIC_PREFIX>/lora-gateway/health`
+- `<MQTT_TOPIC_PREFIX>/lora-gateway/rx`
+- `<MQTT_TOPIC_PREFIX>/lora-gateway/temperature`
 
 Home Assistant discovery uses the default prefix `homeassistant`.
 
@@ -150,7 +164,7 @@ Example gateway health fields:
 Temperature behavior:
 
 - Uses an optional I2C BME280 sensor at `0x76` or `0x77`
-- Publishes to `littlelodge/lora-gateway/temperature`
+- Publishes to `<MQTT_TOPIC_PREFIX>/lora-gateway/temperature`
 - Continues running if the BME280 is not found
 
 Reconnect timing:

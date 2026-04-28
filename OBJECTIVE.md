@@ -5,7 +5,8 @@ It will take these messages and send them to Home Assistant via MQTT.
 This LoRa Gateway will reside in the attic of a house.
 A router will also reside with the gateway.
 
-Gateway MQTT topics should use the `littlelodge/lora-gateway/...` namespace.
+Gateway MQTT topics should use the `<MQTT_TOPIC_PREFIX>/lora-gateway/...` namespace,
+where `MQTT_TOPIC_PREFIX` is supplied by the local, ignored `src/secrets.h` file.
 Received LoRa messages should be published as JSON with the original payload,
 packet RSSI, packet SNR, and running packet count.
 
@@ -45,11 +46,11 @@ The gateway should publish retained Home Assistant MQTT discovery configs so
 gateway sensors and status values appear automatically in Home Assistant.
 
 The expected gateway MQTT topics are:
-1. `littlelodge/lora-gateway/status`
-2. `littlelodge/lora-gateway/availability`
-3. `littlelodge/lora-gateway/health`
-4. `littlelodge/lora-gateway/rx`
-5. `littlelodge/lora-gateway/temperature`
+1. `<MQTT_TOPIC_PREFIX>/lora-gateway/status`
+2. `<MQTT_TOPIC_PREFIX>/lora-gateway/availability`
+3. `<MQTT_TOPIC_PREFIX>/lora-gateway/health`
+4. `<MQTT_TOPIC_PREFIX>/lora-gateway/rx`
+5. `<MQTT_TOPIC_PREFIX>/lora-gateway/temperature`
 
 The BME280 temperature sensor should be optional. The firmware should continue
 running if the sensor is not found at `0x76` or `0x77`.

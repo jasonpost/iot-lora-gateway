@@ -46,9 +46,18 @@ const uint16_t MQTT_PORT = 1883;
 const char* MQTT_CLIENT_ID = "iot-lora-gateway";
 const char* MQTT_USER = "...";
 const char* MQTT_PASS = "...";
-const char* MQTT_TOPIC_STATUS = "site/lora/status";
-const char* MQTT_TOPIC_RX = "site/lora/data";
 ```
+
+Non-secret gateway settings, including MQTT topics and publish intervals, live in
+`src/config.h`.
+
+Default MQTT topics:
+
+- `site/lora-gateway/status`
+- `site/lora-gateway/availability`
+- `site/lora-gateway/health`
+- `site/lora-gateway/rx`
+- `site/lora-gateway/temperature`
 
 ## Build
 

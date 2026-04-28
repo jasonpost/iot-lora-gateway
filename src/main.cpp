@@ -6,10 +6,8 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "config.h"
 #include "secrets.h"
-const unsigned long MQTT_HEARTBEAT_MS = 30000;
-const unsigned long WIFI_RETRY_MS = 15000;
-const unsigned long MQTT_RETRY_MS = 5000;
 
 static constexpr int PIN_LED = 35;
 static constexpr int PIN_VEXT = 36;

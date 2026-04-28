@@ -16,9 +16,28 @@ Firmware for a Heltec WiFi LoRa 32 V4 that receives LoRa packets and republishes
 ## Hardware
 
 - Heltec WiFi LoRa 32 V4
+- Optional I2C BME280 sensor for attic temperature, humidity, and pressure
 - USB connection for flashing and serial monitoring
 - A reachable Wi-Fi network
 - An MQTT broker reachable from that network
+- Shelly 2PM, or equivalent listed smart relay/power meter, for attic outlet control and power monitoring
+
+## Power Control
+
+The gateway firmware does not switch mains power directly. Use a Shelly 2PM, or an
+equivalent listed smart relay/power meter, for router and attic equipment power
+control.
+
+Recommended Shelly responsibilities:
+
+- Control the router outlet.
+- Optionally control a second attic equipment outlet.
+- Report power state and power usage directly to Home Assistant.
+- Restore controlled outputs to ON after power loss.
+
+Do not power the LoRa gateway from an outlet that only the gateway can turn back
+on. Keep an independent recovery path so the gateway cannot strand itself
+powered off.
 
 ## Project Layout
 
@@ -53,11 +72,13 @@ Non-secret gateway settings, including MQTT topics and publish intervals, live i
 
 Default MQTT topics:
 
-- `site/lora-gateway/status`
-- `site/lora-gateway/availability`
-- `site/lora-gateway/health`
-- `site/lora-gateway/rx`
-- `site/lora-gateway/temperature`
+- `littlelodge/lora-gateway/status`
+- `littlelodge/lora-gateway/availability`
+- `littlelodge/lora-gateway/health`
+- `littlelodge/lora-gateway/rx`
+- `littlelodge/lora-gateway/temperature`
+
+Home Assistant discovery uses the default prefix `homeassistant`.
 
 ## Build
 
@@ -92,8 +113,45 @@ LoRa settings in the current firmware:
 MQTT behavior in the current firmware:
 
 - Publishes `gateway bring-up online` after a successful MQTT connection
+- Publishes retained availability of `online` after MQTT connects
+- Registers an MQTT Last Will of retained `offline`
+- Publishes retained Home Assistant MQTT discovery configs after MQTT connects
 - Publishes `gateway alive` every 30 seconds while connected
-- Publishes each received LoRa payload to `MQTT_TOPIC_RX`
+- Publishes retained gateway health JSON every 30 seconds
+- Publishes retained BME280 temperature JSON every 60 seconds when the sensor is present
+- Publishes each received LoRa payload with RSSI, SNR, and packet count metadata
+
+Example LoRa receive payload:
+
+```json
+{"payload":"sensor payload","rssi_dbm":-78.5,"snr_db":8.2,"packet_count":42}
+```
+
+Example gateway health fields:
+
+- `uptime_s`
+- `wifi_connected`
+- `wifi_rssi_dbm`
+- `ip`
+- `mqtt_connected`
+- `lora_ready`
+- `last_lora_state`
+- `packets_received`
+- `decode_failures`
+- `rx_failures`
+- `mqtt_publish_successes`
+- `mqtt_publish_failures`
+- `last_packet_rssi_dbm`
+- `last_packet_snr_db`
+- `temperature_available`
+- `temperature_c`
+- `free_heap`
+
+Temperature behavior:
+
+- Uses an optional I2C BME280 sensor at `0x76` or `0x77`
+- Publishes to `littlelodge/lora-gateway/temperature`
+- Continues running if the BME280 is not found
 
 Reconnect timing:
 
@@ -108,6 +166,7 @@ Declared in `platformio.ini`:
 - `knolleary/PubSubClient`
 - `adafruit/Adafruit SSD1306`
 - `adafruit/Adafruit GFX Library`
+- `adafruit/Adafruit BME280 Library`
 
 ## Notes
 

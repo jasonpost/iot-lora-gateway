@@ -6,6 +6,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_BME280.h>
 #include "config.h"
 #include "secrets.h"
 
@@ -27,6 +28,7 @@ static constexpr int SCREEN_WIDTH = 128;
 static constexpr int SCREEN_HEIGHT = 64;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, PIN_OLED_RST);
+Adafruit_BME280 bme;
 SPIClass loraSPI(FSPI);
 SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY, loraSPI);
 WiFiClient wifiClient;
@@ -38,9 +40,251 @@ bool wifiReady = false;
 bool mqttReady = false;
 String lastLoRaMessage;
 unsigned long lastHeartbeatMs = 0;
+unsigned long lastHealthPublishMs = 0;
+unsigned long lastTemperaturePublishMs = 0;
 unsigned long lastWiFiAttemptMs = 0;
 unsigned long lastMQTTAttemptMs = 0;
 int lastLoRaRxState = RADIOLIB_ERR_NONE;
+uint32_t loraPacketsReceived = 0;
+uint32_t loraDecodeFailures = 0;
+uint32_t loraRxFailures = 0;
+uint32_t mqttPublishSuccesses = 0;
+uint32_t mqttPublishFailures = 0;
+float lastPacketRSSI = 0.0;
+float lastPacketSNR = 0.0;
+bool temperatureReady = false;
+float lastTemperatureC = 0.0;
+float lastHumidityPercent = 0.0;
+float lastPressureHpa = 0.0;
+
+String jsonEscape(const String& value) {
+  String escaped;
+  escaped.reserve(value.length() + 8);
+
+  for (size_t i = 0; i < value.length(); ++i) {
+    char c = value.charAt(i);
+    switch (c) {
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      default:
+        if (c < 0x20) {
+          char encoded[7];
+          snprintf(encoded, sizeof(encoded), "\\u%04x", static_cast<unsigned char>(c));
+          escaped += encoded;
+        } else {
+          escaped += c;
+        }
+        break;
+    }
+  }
+
+  return escaped;
+}
+
+bool publishMQTT(const char* topic, const char* payload, bool retained = false) {
+  bool ok = mqtt.publish(topic, payload, retained);
+  if (ok) {
+    ++mqttPublishSuccesses;
+  } else {
+    ++mqttPublishFailures;
+  }
+  return ok;
+}
+
+bool publishMQTT(const char* topic, const String& payload, bool retained = false) {
+  return publishMQTT(topic, payload.c_str(), retained);
+}
+
+String discoveryDeviceJson() {
+  return String("\"device\":{\"identifiers\":[\"") + DEVICE_ID + "\"],\"name\":\"" + DEVICE_NAME + "\"}";
+}
+
+void publishSensorDiscovery(
+  const char* objectId,
+  const char* name,
+  const char* stateTopic,
+  const char* valueTemplate,
+  const char* unit = "",
+  const char* deviceClass = "",
+  const char* stateClass = "") {
+
+  String topic = String(HA_DISCOVERY_PREFIX) + "/sensor/" + DEVICE_ID + "/" + objectId + "/config";
+  String payload = String("{\"name\":\"") + name +
+                   "\",\"unique_id\":\"" + DEVICE_ID + "_" + objectId +
+                   "\",\"state_topic\":\"" + stateTopic +
+                   "\",\"value_template\":\"" + valueTemplate +
+                   "\",\"availability_topic\":\"" + GATEWAY_MQTT_TOPIC_AVAILABILITY +
+                   "\",\"payload_available\":\"" + GATEWAY_AVAILABILITY_ONLINE +
+                   "\",\"payload_not_available\":\"" + GATEWAY_AVAILABILITY_OFFLINE + "\"";
+
+  if (unit[0] != '\0') {
+    payload += String(",\"unit_of_measurement\":\"") + unit + "\"";
+  }
+  if (deviceClass[0] != '\0') {
+    payload += String(",\"device_class\":\"") + deviceClass + "\"";
+  }
+  if (stateClass[0] != '\0') {
+    payload += String(",\"state_class\":\"") + stateClass + "\"";
+  }
+
+  payload += "," + discoveryDeviceJson() + "}";
+  publishMQTT(topic.c_str(), payload, true);
+}
+
+void publishBinarySensorDiscovery(
+  const char* objectId,
+  const char* name,
+  const char* valueTemplate,
+  const char* deviceClass = "") {
+
+  String topic = String(HA_DISCOVERY_PREFIX) + "/binary_sensor/" + DEVICE_ID + "/" + objectId + "/config";
+  String payload = String("{\"name\":\"") + name +
+                   "\",\"unique_id\":\"" + DEVICE_ID + "_" + objectId +
+                   "\",\"state_topic\":\"" + GATEWAY_MQTT_TOPIC_HEALTH +
+                   "\",\"value_template\":\"" + valueTemplate +
+                   "\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\"" +
+                   ",\"availability_topic\":\"" + GATEWAY_MQTT_TOPIC_AVAILABILITY +
+                   "\",\"payload_available\":\"" + GATEWAY_AVAILABILITY_ONLINE +
+                   "\",\"payload_not_available\":\"" + GATEWAY_AVAILABILITY_OFFLINE + "\"";
+
+  if (deviceClass[0] != '\0') {
+    payload += String(",\"device_class\":\"") + deviceClass + "\"";
+  }
+
+  payload += "," + discoveryDeviceJson() + "}";
+  publishMQTT(topic.c_str(), payload, true);
+}
+
+void publishHomeAssistantDiscovery() {
+  publishBinarySensorDiscovery("wifi_connected", "Wi-Fi Connected", "{{ 'ON' if value_json.wifi_connected else 'OFF' }}", "connectivity");
+  publishBinarySensorDiscovery("mqtt_connected", "MQTT Connected", "{{ 'ON' if value_json.mqtt_connected else 'OFF' }}", "connectivity");
+  publishBinarySensorDiscovery("lora_ready", "LoRa Ready", "{{ 'ON' if value_json.lora_ready else 'OFF' }}", "connectivity");
+  publishBinarySensorDiscovery("temperature_available", "Temperature Sensor", "{{ 'ON' if value_json.temperature_available else 'OFF' }}", "connectivity");
+  publishSensorDiscovery("uptime", "Uptime", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.uptime_s }}", "s", "duration", "total_increasing");
+  publishSensorDiscovery("wifi_rssi", "Wi-Fi RSSI", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.wifi_rssi_dbm }}", "dBm", "signal_strength", "measurement");
+  publishSensorDiscovery("packets_received", "LoRa Packets Received", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.packets_received }}", "", "", "total_increasing");
+  publishSensorDiscovery("decode_failures", "LoRa Decode Failures", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.decode_failures }}", "", "", "total_increasing");
+  publishSensorDiscovery("rx_failures", "LoRa RX Failures", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.rx_failures }}", "", "", "total_increasing");
+  publishSensorDiscovery("mqtt_publish_failures", "MQTT Publish Failures", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.mqtt_publish_failures }}", "", "", "total_increasing");
+  publishSensorDiscovery("last_packet_rssi", "Last LoRa RSSI", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.last_packet_rssi_dbm }}", "dBm", "signal_strength", "measurement");
+  publishSensorDiscovery("last_packet_snr", "Last LoRa SNR", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.last_packet_snr_db }}", "dB", "", "measurement");
+  publishSensorDiscovery("free_heap", "Free Heap", GATEWAY_MQTT_TOPIC_HEALTH, "{{ value_json.free_heap }}", "B", "data_size", "measurement");
+  publishSensorDiscovery("temperature", "Attic Temperature", GATEWAY_MQTT_TOPIC_TEMPERATURE, "{{ value_json.temperature_c }}", "°C", "temperature", "measurement");
+  publishSensorDiscovery("humidity", "Attic Humidity", GATEWAY_MQTT_TOPIC_TEMPERATURE, "{{ value_json.humidity_percent }}", "%", "humidity", "measurement");
+  publishSensorDiscovery("pressure", "Attic Pressure", GATEWAY_MQTT_TOPIC_TEMPERATURE, "{{ value_json.pressure_hpa }}", "hPa", "pressure", "measurement");
+  Serial.println("Home Assistant discovery published");
+}
+
+bool readTemperatureSensor() {
+  if (!temperatureReady) {
+    return false;
+  }
+
+  lastTemperatureC = bme.readTemperature();
+  lastHumidityPercent = bme.readHumidity();
+  lastPressureHpa = bme.readPressure() / 100.0F;
+
+  return !isnan(lastTemperatureC);
+}
+
+void publishTemperature() {
+  if (!mqttReady || !readTemperatureSensor()) {
+    return;
+  }
+
+  char payload[96];
+  snprintf(
+    payload,
+    sizeof(payload),
+    "{\"temperature_c\":%.2f,\"humidity_percent\":%.2f,\"pressure_hpa\":%.2f}",
+    lastTemperatureC,
+    lastHumidityPercent,
+    lastPressureHpa);
+
+  if (publishMQTT(GATEWAY_MQTT_TOPIC_TEMPERATURE, payload, true)) {
+    Serial.println("MQTT temperature OK");
+  } else {
+    Serial.println("MQTT temperature FAIL");
+  }
+}
+
+void publishHealth() {
+  if (!mqttReady) {
+    return;
+  }
+
+  char payload[512];
+  char temperatureJson[16];
+  String ip = (wifiReady && WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
+  int wifiRSSI = (wifiReady && WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+
+  if (temperatureReady && readTemperatureSensor()) {
+    snprintf(temperatureJson, sizeof(temperatureJson), "%.2f", lastTemperatureC);
+  } else {
+    snprintf(temperatureJson, sizeof(temperatureJson), "null");
+  }
+
+  snprintf(
+    payload,
+    sizeof(payload),
+    "{\"device_id\":\"%s\",\"uptime_s\":%lu,\"wifi_connected\":%s,\"wifi_rssi_dbm\":%d,\"ip\":\"%s\",\"mqtt_connected\":%s,\"lora_ready\":%s,\"last_lora_state\":%d,\"packets_received\":%lu,\"decode_failures\":%lu,\"rx_failures\":%lu,\"mqtt_publish_successes\":%lu,\"mqtt_publish_failures\":%lu,\"last_packet_rssi_dbm\":%.1f,\"last_packet_snr_db\":%.1f,\"temperature_available\":%s,\"temperature_c\":%s,\"free_heap\":%lu}",
+    DEVICE_ID,
+    static_cast<unsigned long>(millis() / 1000UL),
+    (wifiReady && WiFi.status() == WL_CONNECTED) ? "true" : "false",
+    wifiRSSI,
+    ip.c_str(),
+    mqttReady ? "true" : "false",
+    loraReady ? "true" : "false",
+    lastLoRaRxState,
+    static_cast<unsigned long>(loraPacketsReceived),
+    static_cast<unsigned long>(loraDecodeFailures),
+    static_cast<unsigned long>(loraRxFailures),
+    static_cast<unsigned long>(mqttPublishSuccesses),
+    static_cast<unsigned long>(mqttPublishFailures),
+    lastPacketRSSI,
+    lastPacketSNR,
+    temperatureReady ? "true" : "false",
+    temperatureJson,
+    static_cast<unsigned long>(ESP.getFreeHeap()));
+
+  if (publishMQTT(GATEWAY_MQTT_TOPIC_HEALTH, payload, true)) {
+    Serial.println("MQTT health OK");
+  } else {
+    Serial.println("MQTT health FAIL");
+  }
+}
+
+void setupTemperatureSensor() {
+  if (!TEMPERATURE_SENSOR_ENABLED) {
+    Serial.println("Temperature sensor disabled");
+    return;
+  }
+
+  temperatureReady = bme.begin(BME280_ADDRESS_PRIMARY, &Wire);
+  if (!temperatureReady) {
+    temperatureReady = bme.begin(BME280_ADDRESS_SECONDARY, &Wire);
+  }
+
+  if (temperatureReady) {
+    readTemperatureSensor();
+    Serial.println("BME280 OK");
+  } else {
+    Serial.println("BME280 not found");
+  }
+}
 
 void showStatus(const char* line1, const char* line2 = "", const char* line3 = "") {
   display.clearDisplay();
@@ -88,11 +332,21 @@ void connectMQTT() {
   }
 
   Serial.print("Connecting MQTT...");
-  if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+  if (mqtt.connect(
+        MQTT_CLIENT_ID,
+        MQTT_USER,
+        MQTT_PASS,
+        GATEWAY_MQTT_TOPIC_AVAILABILITY,
+        1,
+        true,
+        GATEWAY_AVAILABILITY_OFFLINE)) {
     mqttReady = true;
     Serial.println("OK");
-    mqtt.publish(MQTT_TOPIC_STATUS, "gateway bring-up online");
+    publishMQTT(GATEWAY_MQTT_TOPIC_AVAILABILITY, GATEWAY_AVAILABILITY_ONLINE, true);
+    publishMQTT(GATEWAY_MQTT_TOPIC_STATUS, "gateway bring-up online");
+    publishHomeAssistantDiscovery();
     lastHeartbeatMs = millis();
+    lastHealthPublishMs = 0;
   } else {
     Serial.print("FAIL rc=");
     Serial.println(mqtt.state());
@@ -145,6 +399,7 @@ void setup() {
   Serial.println();
   Serial.println("Heltec V4 bring-up");
   Serial.println("Serial OK");
+  mqtt.setBufferSize(MQTT_BUFFER_SIZE);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
     Serial.println("OLED init failed");
@@ -159,6 +414,7 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   Serial.println("OLED OK");
+  setupTemperatureSensor();
   setupLoRa();
   connectWiFi();
 
@@ -191,11 +447,21 @@ void loop() {
   if (mqttReady) {
     if (now - lastHeartbeatMs >= MQTT_HEARTBEAT_MS) {
       lastHeartbeatMs = now;
-      if (mqtt.publish(MQTT_TOPIC_STATUS, "gateway alive")) {
+      if (publishMQTT(GATEWAY_MQTT_TOPIC_STATUS, "gateway alive")) {
         Serial.println("MQTT heartbeat OK");
       } else {
         Serial.println("MQTT heartbeat FAIL");
       }
+    }
+
+    if (lastHealthPublishMs == 0 || now - lastHealthPublishMs >= MQTT_HEALTH_PUBLISH_MS) {
+      lastHealthPublishMs = now;
+      publishHealth();
+    }
+
+    if (temperatureReady && (lastTemperaturePublishMs == 0 || now - lastTemperaturePublishMs >= MQTT_TEMPERATURE_PUBLISH_MS)) {
+      lastTemperaturePublishMs = now;
+      publishTemperature();
     }
   }
   serviceConnectivity(now);
@@ -209,15 +475,23 @@ void loop() {
     if (state == RADIOLIB_ERR_NONE) {
       lastLoRaRxState = state;
       lastLoRaMessage = incoming;
+      ++loraPacketsReceived;
+      lastPacketRSSI = radio.getRSSI();
+      lastPacketSNR = radio.getSNR();
       Serial.print("LoRa RX: ");
       Serial.println(incoming);
       Serial.print("RSSI: ");
-      Serial.print(radio.getRSSI());
+      Serial.print(lastPacketRSSI);
       Serial.print(" dBm | SNR: ");
-      Serial.println(radio.getSNR());
+      Serial.println(lastPacketSNR);
 
       if (mqttReady) {
-        if (mqtt.publish(MQTT_TOPIC_RX, incoming.c_str())) {
+        String payload = "{\"payload\":\"" + jsonEscape(incoming) +
+                         "\",\"rssi_dbm\":" + String(lastPacketRSSI, 1) +
+                         ",\"snr_db\":" + String(lastPacketSNR, 1) +
+                         ",\"packet_count\":" + String(loraPacketsReceived) + "}";
+
+        if (publishMQTT(GATEWAY_MQTT_TOPIC_RX, payload)) {
           Serial.println("MQTT publish OK");
           showStatus("LoRa RX", incoming.substring(0, 20).c_str(), "Published MQTT");
         } else {
@@ -230,10 +504,12 @@ void loop() {
       }
     } else if (state == RADIOLIB_ERR_CRC_MISMATCH || state == RADIOLIB_ERR_LORA_HEADER_DAMAGED) {
       lastLoRaRxState = state;
+      ++loraDecodeFailures;
       Serial.print("LoRa heard packet but could not decode it, state=");
       Serial.println(state);
     } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
       lastLoRaRxState = state;
+      ++loraRxFailures;
       Serial.print("LoRa RX failed: ");
       Serial.println(state);
     }
@@ -274,6 +550,9 @@ void loop() {
       Serial.println("OK");
       if (lastLoRaMessage.length() > 0) {
         showStatus("Gateway Ready", "MQTT OK", lastLoRaMessage.substring(0, 20).c_str());
+      } else if (temperatureReady && readTemperatureSensor()) {
+        String tempLine = "Temp " + String(lastTemperatureC, 1) + " C";
+        showStatus("Gateway Ready", "MQTT OK", tempLine.c_str());
       } else {
         showStatus("Gateway Ready", "MQTT OK", WiFi.localIP().toString().c_str());
       }
